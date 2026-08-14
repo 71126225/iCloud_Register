@@ -21,7 +21,7 @@ RUN cd web && npm run build
 FROM golang:1.26-alpine AS backend
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN go mod download
+RUN GOPROXY=https://goproxy.cn go mod download
 COPY . .
 # 用阶段 1 的前端产物覆盖占位目录
 COPY --from=web /app/internal/server/web/dist ./internal/server/web/dist
