@@ -2,10 +2,13 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"icloud_distribution/internal/hme"
 )
 
 // ====================================================================
@@ -31,7 +34,7 @@ func (s *Server) createAlias(c *gin.Context) {
 		return
 	}
 
-	result, err := client.CreateAlias(req.Label, 5)
+	result, err := client.CreateAlias(req.Label)
 
 	// 操作完成后,保存可能已刷新的 Cookie（validate 会轮换 token）
 	_ = s.mgr.SaveCookies(req.AccountID, client.Cookies)
@@ -104,11 +107,11 @@ func (s *Server) batchCreateAliases(c *gin.Context) {
 			label = label + " " + strconv.Itoa(i+1)
 		}
 
-		res, err := client.CreateAlias(label, 5)
+		res, err := client.CreateAlias(label)
 		if err != nil {
 			results = append(results, batchResult{Index: i + 1, Label: label, Error: err.Error()})
-			// 会话失效时没有继续的必要,直接中断
-			if isSessionError(err.Error()) {
+			// 会话失效或 Apple 已限制创建时，继续请求没有意义。
+			if shouldInterruptAliasBatch(err) {
 				break
 			}
 			continue
@@ -120,13 +123,17 @@ func (s *Server) batchCreateAliases(c *gin.Context) {
 	_ = s.mgr.SaveCookies(id, client.Cookies)
 
 	ok(c, gin.H{
-		"account_id": id,
-		"requested":  req.Count,
-		"succeeded":  succeeded,
-		"failed":     len(results) - succeeded,
+		"account_id":  id,
+		"requested":   req.Count,
+		"succeeded":   succeeded,
+		"failed":      len(results) - succeeded,
 		"interrupted": len(results) < req.Count,
-		"results":    results,
+		"results":     results,
 	})
+}
+
+func shouldInterruptAliasBatch(err error) bool {
+	return err != nil && (isSessionError(err.Error()) || errors.Is(err, hme.ErrAddressCreationLimited))
 }
 
 // ====================================================================
@@ -134,7 +141,8 @@ func (s *Server) batchCreateAliases(c *gin.Context) {
 // ====================================================================
 
 // setForwardTo 修改 HME 转发目标邮箱 (账号级,影响全部别名)。
-//   POST /api/accounts/:id/forward-to  body: {"email": "muskzhou@icloud.com"}
+//
+//	POST /api/accounts/:id/forward-to  body: {"email": "muskzhou@icloud.com"}
 func (s *Server) setForwardTo(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {

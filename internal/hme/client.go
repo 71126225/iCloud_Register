@@ -7,6 +7,7 @@ package hme
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -20,6 +21,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
+
+// ErrAddressCreationLimited 表示 Apple 暂时限制当前账号创建 HME 地址。
+// 该错误需要等待账号侧限制解除，立即重试只会增加无效请求。
+var ErrAddressCreationLimited = errors.New("iCloud 隐私邮箱创建受限")
 
 const (
 	// ClientBuildNumber 是 iCloud Web 客户端构建号,从浏览器抓包获取。
@@ -448,7 +453,7 @@ func (c *Client) Generate() (string, error) {
 		return "", err
 	}
 	c.log("生成候选别名...")
-	body, err := c.request("POST", c.serviceURL+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 2)
+	body, err := c.request("POST", c.serviceURL+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 1)
 	if err != nil {
 		return "", err
 	}
@@ -483,13 +488,16 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 		"label": label,
 		"note":  "Created by icloud_hme tool",
 	}
-	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 2)
+	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
 		return "", err
 	}
 	parsed := gjson.Parse(body)
 	if !parsed.Get("success").Bool() {
 		errMsg := parsed.Get("error.errorMessage").String()
+		if isAddressCreationLimitMessage(errMsg) {
+			return "", fmt.Errorf("保留失败: %w: %s", ErrAddressCreationLimited, nonEmpty(errMsg, "unknown"))
+		}
 		return "", fmt.Errorf("保留失败: %s", nonEmpty(errMsg, "unknown"))
 	}
 	alias := hme
@@ -510,51 +518,30 @@ type CreateResult struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// CreateAlias 一步完成「生成 + 保留」,创建一个新别名。
-//
-// 由于 generate / reserve 偶发失败,内部会重试 maxRetries 次,
-// 每次重试会重置 serviceURL 强制重新校验会话。
-func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error) {
-	if maxRetries <= 0 {
-		maxRetries = 5
+// CreateAlias 按顺序各请求一次 generate 和 reserve 来创建别名。
+// 创建接口具有副作用，失败后不自动重放，避免重复创建或触发 Apple 风控。
+func (c *Client) CreateAlias(label string) (*CreateResult, error) {
+	hme, err := c.Generate()
+	if err != nil {
+		return nil, fmt.Errorf("创建别名失败: generate 失败: %w", err)
 	}
-	var lastErr string
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			c.serviceURL = ""
-			c.setupURL = ""
-			c.log("重试 %d/%d ...", attempt+1, maxRetries)
-		}
-		hme, err := c.Generate()
-		if err != nil {
-			lastErr = "generate 失败: " + err.Error()
-			c.log("%s", lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(time.Second)
-				continue
-			}
-			break
-		}
-		email, err := c.Reserve(hme, label)
-		if err != nil {
-			lastErr = err.Error()
-			c.log("reserve 失败: %s", lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(time.Second)
-				continue
-			}
-			break
-		}
-		return &CreateResult{
-			Email:     email,
-			Label:     label,
-			CreatedAt: time.Now().Format(time.RFC3339),
-		}, nil
+	email, err := c.Reserve(hme, label)
+	if err != nil {
+		return nil, fmt.Errorf("创建别名失败: %w", err)
 	}
-	if lastErr != "" {
-		return nil, fmt.Errorf("创建别名失败: %s", lastErr)
-	}
-	return nil, fmt.Errorf("创建别名失败,已重试 %d 次", maxRetries)
+	return &CreateResult{
+		Email:     email,
+		Label:     label,
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+func isAddressCreationLimitMessage(message string) bool {
+	m := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(m, "reached the limit of addresses") ||
+		strings.Contains(m, "limit of addresses you can create") ||
+		strings.Contains(m, "地址数量已达上限") ||
+		strings.Contains(m, "电子邮件已达上限")
 }
 
 // UpdateForwardTo 修改 HME 转发目标邮箱 (账号级设置,影响全部别名)。
